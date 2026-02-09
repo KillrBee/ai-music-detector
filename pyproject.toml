@@ -1,0 +1,37 @@
+[project]
+name = "ai-audio-detector"
+version = "0.1.0"
+description = "AI-generated music detection system using signal processing and spectral analysis"
+requires-python = ">=3.11,<3.15"
+
+dependencies = [
+    # Server
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "aiofiles",
+    # Audio processing (core)
+    "librosa>=0.11.0",
+    "soundfile>=0.12.1",
+    "scipy>=1.14.0",
+    "numpy>=1.26.4",
+    "matplotlib>=3.9.0",
+    # Loudness analysis
+    "pyloudnorm>=0.2.0",
+    # Utilities
+    "pydantic>=2.0",
+    "pydantic-settings",
+]
+
+[project.optional-dependencies]
+vocal = ["praat-parselmouth>=0.4.5"]
+watermark = ["audioseal>=0.1.5"]
+torch-cpu = ["torch>=2.4.0", "torchaudio>=2.4.0"]
+all = ["ai-audio-detector[vocal,watermark,torch-cpu]"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/app"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

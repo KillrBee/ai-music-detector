@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__filesystem__directory_tree",
+      "Bash(wc:*)",
+      "Bash(uv venv:*)",
+      "Bash(uv pip install:*)",
+      "mcp__filesystem__read_multiple_files",
+      "Bash(npm install:*)",
+      "Bash(npm run build:*)",
+      "Bash(source:*)",
+      "Bash(python -c:*)",
+      "Bash(python3:*)",
+      "Bash(unzip:*)",
+      "Bash(ls:*)",
+      "Bash(gh repo view:*)",
+      "Bash(git --version:*)",
+      "Bash(git config:*)",
+      "Bash(brew:*)",
+      "Bash(/opt/homebrew/bin/gh auth status:*)"
+    ]
+  }
+}
