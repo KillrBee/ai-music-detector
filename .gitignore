@@ -32,6 +32,7 @@ backend/uploads/*
 # Environment
 .env
 .env.local
+.claude
 
 # Node
 node_modules/
