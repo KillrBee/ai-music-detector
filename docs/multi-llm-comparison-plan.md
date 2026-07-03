@@ -37,9 +37,13 @@ analytical processing.
 | R5 | Judge evaluates quality, accuracy, completeness; compares responses to each other; ranks them; maps domain capabilities and failures per model |
 | R6 | All artifacts logged and stored by conversation ID, tagged with model name and version |
 | R7 | Full-fidelity record: user prompts, system prompts, tool calls, tool results, thinking blocks, final responses — queryable for analytics |
-| R8 | Tool calls execute autonomously (no user in the loop); each LLM has full access to the host VM but works inside its own subdirectory under the conversation directory |
+| R8 | Tool calls execute autonomously (no user in the loop); each LLM has broad system access and works inside its own subdirectory under the conversation directory |
 | R9 | Landing page listing every session (comparison conversations and agent sessions) to pick, view, or continue |
 | R10 | A **root agent**: a standalone chat interface bound to one user-selectable endpoint, with full tool access — writes code, makes and inspects changes, cross-compares sessions, analyzes any data in the system; self-developed or built on an existing open-source harness |
+| R11 | Evaluations support **multi-judge ensembles** with repetition: 1..K judges × M passes, candidate order re-randomized per pass, consensus ranking + agreement statistics |
+| R12 | Rolled-up **token and context-window statistics**: per-model/per-turn context utilization and turn-depth retention analytics, so a 1M-context model, a 32k model, and an SSM/Mamba-style model can be compared on how memory holds up as conversations grow |
+| R13 | Competing runs **cannot read** other models' workspaces or other sessions'/platform data (anti-cheating enforcement) — but denied attempts are captured in the logs |
+| R14 | The same model is registrable as multiple **variants** (different system prompts/params), and parameter controls are driven by each endpoint's **published API capabilities** — the same model may expose different knobs on different hosts (e.g. Fireworks exposing temperature for a model that Baseten serves without it) |
 
 ### Non-goals (v1)
 
@@ -72,7 +76,7 @@ Tailwind frontend) so tooling, linting, and deployment knowledge transfer direct
 │  └───────┬────────┘  │  fan-out)    │  └──────────┬───────────┘    │
 │          │           └──────┬───────┘             │                │
 │  ┌───────┴──────────────────┴─────────────────────┴────────────┐  │
-│  │ Tool Execution Runtime — full VM access, per-run workspaces │  │
+│  │ Tool Execution Runtime — per-run OS users & workspaces      │  │
 │  │ data/conversations/{conv_id}/{model-slug}/                  │  │
 │  └──────────────────────────────────────────────────────────────┘ │
 │          └── normalized event stream ─────────────┘                │
@@ -121,15 +125,16 @@ Tailwind frontend) so tooling, linting, and deployment knowledge transfer direct
    `status = 'interrupted'` marker — no "the log is whatever the UI happened
    to show" problem.
 
-5. **Autonomous tool execution; the VM is the sandbox.** Models don't just
-   *emit* tool calls — the backend executes them and loops until the model
-   finishes (an agentic loop per run, like a coding agent). Tools run with
-   the backend's own privileges, i.e. full access to the host, so the
-   deployment assumption is a **dedicated, disposable virtual machine**: the
-   isolation boundary is the VM, not the application. Filesystem hygiene
-   between concurrently-running models comes from **per-run workspaces**
-   (`data/conversations/{conversation_id}/{model-slug}/`) — each model's cwd
-   and instructed write-root is its own subdirectory. See §4.4.
+5. **Autonomous tool execution; the VM is the sandbox, per-run OS users are
+   the referee.** Models don't just *emit* tool calls — the backend executes
+   them and loops until the model finishes (an agentic loop per run, like a
+   coding agent). The deployment assumption is still a **dedicated,
+   disposable virtual machine**, but each model's tools run as a dedicated
+   unprivileged OS user confined to its own workspace
+   (`data/conversations/{conversation_id}/{model-slug}/`): broad access to
+   the system, **no read access to competitors' work, other sessions, or the
+   platform's own record** — cheating is blocked, and the blocked attempts
+   land in the logs (R13). See §4.4.
 
 6. **The judge is just another endpoint.** Evaluations are dispatched through
    the same adapter/recorder machinery as chat broadcasts, so judge prompts,
@@ -214,6 +219,7 @@ class ProviderAdapter(Protocol):
     ) -> AsyncIterator[NormalizedEvent]: ...
 
     async def list_models(self) -> list[ModelInfo]: ...
+    async def get_capabilities(self, model: str) -> CapabilityManifest: ...   # R14, §4.5
     async def health_check(self) -> HealthStatus: ...
 ```
 
@@ -280,8 +286,8 @@ format by the registry so every model gets functionally identical tools):
 
 | Tool | Behavior |
 |---|---|
-| `bash` | Execute a shell command on the VM. Runs as the backend's user (full system access by design). `cwd` defaults to the run's workspace. Streams stdout/stderr as `tool_output_delta` events; captures exit code. Per-call timeout (default 120 s, model can request up to a cap). |
-| `read_file` | Read any path on the VM (full read access). |
+| `bash` | Execute a shell command on the VM. Runs as the run's dedicated unprivileged OS user (broad system access; isolation per R13, below). `cwd` defaults to the run's workspace. Streams stdout/stderr as `tool_output_delta` events; captures exit code. Per-call timeout (default 120 s, model can request up to a cap). |
+| `read_file` | Read any path the run's OS user can read — the general system yes; competitor workspaces, other sessions, and platform data no (R13). |
 | `write_file` / `edit_file` | Write/edit files. Paths resolve relative to the run's workspace; absolute paths **outside** the workspace are allowed only when `allow_outside_workspace` is enabled on the endpoint config (default **off** — see write-root policy below). |
 | `list_dir` | Directory listing. |
 | `web_fetch` | HTTP GET with size cap (models on the VM can also just `curl` via bash; this exists as a cheaper structured path). |
@@ -304,13 +310,31 @@ data/conversations/{conversation_id}/
 - Every model's system prompt is injected with a **workspace contract**: its
   absolute workspace path, an instruction that all artifacts must be created
   under it, and a note that `shared/` is read-only common input.
-- Enforcement is layered: `read` is unrestricted (full VM access per R8);
-  structured `write_file`/`edit_file` calls are *path-checked* against the
-  workspace by default; `bash` is uncheckable by nature (root access is the
-  requirement), so bash relies on the contract + cwd defaulting — and the
-  **workspace manifest** (filesystem snapshot diff per tool call, recorded as
-  part of `tool_result`) makes any out-of-workspace writes visible after the
-  fact rather than silently lost.
+- **Anti-cheating isolation (R13).** Each model-slug workspace is owned by a
+  dedicated unprivileged OS user (`arena-{slug}`), mode `0700`; the executor
+  spawns that run's tool processes — `bash` included — as that user. The
+  arena's own assets (SQLite DB, JSONL logs, vault, app source) belong to the
+  service user. Consequence: a model can roam the general system, but it
+  **cannot** read a competitor's workspace, another session's artifacts, or
+  the conversation record — so it can't crib answers or peek at judge
+  verdicts. `shared/` is group-readable to all run users (read-only common
+  input). Denied attempts surface as `EACCES` in the tool output and are
+  recorded like every other event — **cheating attempts are themselves a
+  logged, queryable model-behavior signal** (`SELECT … WHERE stderr LIKE
+  '%Permission denied%' AND path LIKE '%/other-slug/%'`).
+- The isolation trade-off, stated honestly: unprivileged users can't
+  `apt install` globally. Mitigations: a **pre-provisioned base image**
+  (compilers, Python/Node toolchains, common CLIs) plus user-space package
+  managers (`uv`, `pip --user`, `npm --prefix`, conda) cover almost all real
+  tasks. For workloads that genuinely need root and where cheating is a
+  non-issue, a per-broadcast **trusted mode** toggle runs tools as the
+  service user — the mode is recorded on every run so analytics can
+  distinguish confined from unconfined results.
+- Structured `write_file`/`edit_file` calls are additionally *path-checked*
+  against the workspace, and the **workspace manifest** (filesystem snapshot
+  diff per tool call, recorded as part of `tool_result`) attributes every
+  file to the run that produced it and flags writes that landed outside the
+  workspace (still possible in world-writable locations like `/tmp`).
 
 **Budgets & safety valves** (per run, configurable per endpoint):
 max agentic iterations (default 25), max total tool-execution wall time
@@ -320,10 +344,11 @@ terminates the process group of any in-flight tool). Runaway detection: N
 identical consecutive tool calls short-circuits with an error result.
 
 **Concurrency model.** N models execute tools on the same VM simultaneously.
-File-level collisions are prevented by per-model workspaces; *system-level*
-collisions (apt/pip installs, port binding, killing processes) are not
-preventable when everyone has root — mitigations: (a) system prompt contract
-asks models to prefer virtualenvs and ephemeral ports, (b) an optional
+File-level collisions are prevented by per-model workspaces, and the per-user
+isolation also removes most *system-level* interference (a run can't kill
+another run's processes or corrupt the global toolchain). What remains shared
+is ports, CPU/RAM, and disk — mitigations: (a) the system prompt contract
+asks models to use ephemeral ports and user-space envs, (b) an optional
 **serialized-bash mode** per broadcast (global mutex on `bash`) for workloads
 where interference is likely, (c) the deployment doc mandates a disposable VM
 snapshot/restore workflow so a trashed machine is a reset, not an incident.
@@ -333,6 +358,37 @@ timestamps, exit code, full stdout/stderr (up to cap, with truncation
 markers), and the workspace manifest diff — all as `events` rows tagged to the
 run, satisfying R7 for the tool dimension. Artifacts themselves stay on disk
 in the workspace and are browsable/downloadable from the UI.
+
+### 4.5 Capability manifests & model variants (R14)
+
+The same model behaves differently depending on who serves it: one host
+exposes `temperature` for a model, another doesn't; context windows, max
+output tokens, tool-use, vision, structured output, and thinking-budget
+support all vary per **endpoint+model pair**, not per model. So capabilities
+are a first-class, cached object with **provenance**:
+
+| Source (increasing authority) | Example |
+|---|---|
+| `static_table` | curated per-provider-family defaults shipped with the app (context windows, known params) |
+| `provider_api` | live model-metadata endpoints where the host publishes them (OpenRouter/Fireworks model info, Anthropic/OpenAI model listings, Ollama `/api/show`) |
+| `probe` | empirical verification — send a minimal request with the param set and record whether the host honors, rejects, or **silently ignores** it (silent-ignore is common and is exactly the Fireworks-vs-Baseten trap; probing catches it where the response metadata allows) |
+| `manual` | user override in the endpoint editor, always wins |
+
+The manifest gates three things: (1) **UI** — the per-selection parameter
+popover renders only the knobs this endpoint+model actually exposes, greying
+out the rest with a "not exposed by this host" note; (2) **request building**
+— adapters never send unsupported params (avoiding hard errors on strict
+hosts and false confidence on lenient ones); (3) **analytics** — every run
+already snapshots the request, so "was temperature actually in effect for
+this response?" is always answerable.
+
+**Variants:** an endpoint selection is `{endpoint, model, variant_label,
+system_prompt?, params}` and the same endpoint+model may appear multiple
+times with distinct labels — `glm-5.2 @ fireworks / temp 0.2` next to
+`glm-5.2 @ fireworks / temp 1.0` next to `glm-5.2 @ baseten`. Variants get
+their own response panels, their own workspace slugs, and their own identity
+in evaluations and analytics, which turns the comparison surface into a
+prompt/parameter lab as well as a cross-vendor one.
 
 ---
 
@@ -350,6 +406,17 @@ endpoints(
   base_url TEXT, default_model TEXT, default_params JSON,
   credential_ref TEXT,                                     -- vault handle, never the key
   enabled BOOL, created_at, updated_at
+)
+
+-- Cached capability manifest per endpoint+model (R14)
+model_capabilities(
+  endpoint_id FK→endpoints, model TEXT,
+  context_window INT, max_output_tokens INT,
+  params_supported JSON,                                   -- {temperature: honored|ignored|rejected, top_p: …, thinking_budget: …}
+  features JSON,                                           -- tools, vision, structured_output, streaming, reasoning
+  source TEXT,                                             -- static_table | provider_api | probe | manual
+  verified_at TIMESTAMP,
+  PK (endpoint_id, model)
 )
 
 conversations(
@@ -372,6 +439,7 @@ runs(
   conversation_id FK,                                      -- denormalized for query speed
   endpoint_id FK→endpoints,
   model_requested TEXT, model_resolved TEXT,               -- name + version tags (R6)
+  variant_label TEXT,                                      -- distinguishes same-model variants (R14)
   params JSON, request_snapshot JSON,                      -- full scrubbed outbound payload
   status TEXT,                                             -- pending|streaming|executing_tools|completed|failed|interrupted|cancelled
   workspace_path TEXT,                                     -- data/conversations/{conv}/{model-slug}
@@ -379,6 +447,9 @@ runs(
   stop_reason TEXT, latency_ms INT,
   input_tokens INT, output_tokens INT, reasoning_tokens INT,
   cache_read_tokens INT, cost_estimate_usd NUMERIC,
+  context_window INT, context_used_pct NUMERIC,            -- input_tokens / window at send time (R12)
+  turn_index INT,                                          -- depth of this run within its conversation (R12)
+  isolation_mode TEXT,                                     -- confined | trusted (R13 analytics dimension)
   started_at, completed_at
 )
 
@@ -407,22 +478,32 @@ tool_executions(
   started_at, completed_at
 )
 
--- Judge workflow (R4/R5)
+-- Judge workflow (R4/R5, multi-judge per R11)
 evaluations(
   id UUID PK, conversation_id FK, broadcast_id FK,
-  judge_endpoint_id FK→endpoints, judge_model TEXT,
+  judges JSON,                                             -- [{endpoint_id, model}] ensemble of 1..K judges (R11)
+  repetitions INT,                                         -- passes per judge; candidate order re-randomized each pass
   candidate_run_ids JSON,                                  -- the selected responses
   rubric JSON,                                             -- dimensions + weights used
   status TEXT, created_at, completed_at
 )
 
-evaluation_results(       -- parsed, structured verdict (one row per candidate)
-  id UUID PK, evaluation_id FK, candidate_run_id FK→runs,
+evaluation_results(       -- parsed verdict: one row per candidate PER judge pass
+  id UUID PK, evaluation_id FK,
+  judge_run_id FK→runs,   -- which judge pass produced this row (judge model + its full log)
+  candidate_run_id FK→runs,
   quality_score NUMERIC, accuracy_score NUMERIC, completeness_score NUMERIC,
   overall_score NUMERIC, rank INT,
   domains_capable JSON,   -- [{domain, evidence}]
   domains_failed JSON,    -- [{domain, evidence}]
   strengths TEXT, weaknesses TEXT, factual_issues JSON
+)
+
+evaluation_consensus(     -- rollup across the ensemble: one row per candidate
+  evaluation_id FK, candidate_run_id FK→runs,
+  mean_overall NUMERIC, score_stddev NUMERIC, consensus_rank INT,
+  rank_agreement NUMERIC,                                  -- e.g. Kendall's W across judges × passes
+  dissent JSON                                             -- judge passes that materially disagreed, with deltas
 )
 ```
 
@@ -447,6 +528,8 @@ results are de-anonymized for display and analytics.
 | `GET/POST/PATCH/DELETE /api/endpoints` | Endpoint CRUD (R1) |
 | `POST /api/endpoints/{id}/test` | Live health check + model listing |
 | `GET /api/endpoints/{id}/models` | Enumerate models on that endpoint |
+| `GET /api/endpoints/{id}/capabilities?model=…` | Cached capability manifest + provenance (R14) |
+| `POST /api/endpoints/{id}/capabilities/probe` | Re-verify a manifest empirically against the live host |
 | `GET/POST /api/conversations` | Create/list sessions of both kinds (`?kind=comparison\|agent`, sort by last activity) — backs the landing page (R9) |
 | `GET /api/conversations/{id}` | Full reconstructed transcript (all runs, all events) |
 | `POST /api/agent/sessions` | Create a root-agent session `{endpoint_id, model, system_prompt?}` (R10) |
@@ -459,10 +542,11 @@ results are de-anonymized for display and analytics.
 | `GET /api/conversations/{id}/workspace?path=…` | Browse the conversation directory tree (shared + per-model subdirs) |
 | `GET /api/conversations/{id}/workspace/file?path=…` | Download/preview a workspace artifact |
 | `GET /api/runs/{id}/tools` | Structured tool-execution log for a run (`tool_executions` rows) |
-| `POST /api/evaluations` | `{broadcast_id, candidate_run_ids, judge_endpoint_id, judge_model, rubric?}` (R4) |
-| `GET /api/evaluations/{id}/stream` | SSE of the judge run (thinking + verdict as it forms) |
-| `GET /api/evaluations/{id}` | Parsed structured verdict (R5) |
-| `GET /api/analytics/models` | Aggregates per model: win rate, mean scores per dimension, domain matrix, latency, cost |
+| `POST /api/evaluations` | `{broadcast_id, candidate_run_ids, judges:[…], repetitions, rubric?}` (R4, R11) |
+| `GET /api/evaluations/{id}/stream` | SSE of all judge passes (thinking + verdicts as they form) |
+| `GET /api/evaluations/{id}` | Parsed per-pass verdicts + consensus rollup (R5, R11) |
+| `GET /api/analytics/models` | Aggregates per model/variant: win rate, mean scores per dimension, domain matrix, latency, cost |
+| `GET /api/analytics/context` | Token/context rollups: utilization per turn, retention curves by turn depth (R12) |
 | `GET /api/analytics/export?conversation_id=…&format=jsonl\|csv` | Full-fidelity export (R7) |
 
 ### Broadcast orchestrator behavior
@@ -535,6 +619,13 @@ Manager and Analytics dashboards live in the header.
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+The endpoint selector manages a list of **selections**, not a set of models:
+each selection is `{endpoint, model, variant_label, system_prompt?, params}`
+(§4.5), so the same model can appear several times with different prompts or
+knobs. Clicking a selection opens its parameter popover, rendered from the
+capability manifest — only knobs the host actually exposes are editable, the
+rest are greyed with provenance ("not exposed by this host / unverified").
+
 ### Response panel anatomy (R3, R7 visibility)
 
 Each `ResponsePanel` renders, in stream order: collapsible **thinking block**
@@ -542,7 +633,9 @@ Each `ResponsePanel` renders, in stream order: collapsible **thinking block**
 execution cards** (tool name + syntax-highlighted args + a live mini-terminal
 streaming stdout/stderr via `tool_output_delta`, then exit code, duration, and
 files-touched chips), markdown final text, and a footer with latency / token
-counts / cost estimate / tool-iteration count / model version chip / status.
+counts / cost estimate / tool-iteration count / model version + variant chip /
+a **context-fill gauge** (input tokens vs. this endpoint's window, amber past
+75% — R12) / status.
 Panel actions: select-for-evaluation checkbox, copy, re-run, cancel (kills
 in-flight tools), expand to full screen, open workspace folder, view raw
 request/response JSON.
@@ -559,15 +652,21 @@ reading.
 ### Evaluation console (R4/R5)
 
 1. Check ≥2 response panels → floating "Evaluate" bar appears.
-2. Pick judge endpoint+model (any configured endpoint; sensible default
-   remembered) and optionally edit the **rubric** (default dimensions:
-   quality, accuracy, completeness, each 0–10 with definitions; user can add
-   dimensions/weights — rubric JSON is stored on the evaluation).
-3. Judge streams into a verdict pane: per-response scorecards, **ranking
-   table**, pairwise comparison notes, and a **domain matrix** (rows =
-   domains the judge identified in the task, e.g. "numerical reasoning",
-   "API knowledge", columns = models, cells = capable/partial/failed with
-   evidence quotes).
+2. Pick **one or more judges** (any configured endpoints; last panel
+   remembered as default) and a repetition count — each judge scores every
+   pass with candidate order re-randomized (R11) — and optionally edit the
+   **rubric** (default dimensions: quality, accuracy, completeness, each
+   0–10 with definitions; user can add dimensions/weights — rubric JSON is
+   stored on the evaluation).
+3. Judge passes stream into a verdict pane: per-response scorecards,
+   **ranking table**, pairwise comparison notes, and a **domain matrix**
+   (rows = domains the judge identified in the task, e.g. "numerical
+   reasoning", "API knowledge", columns = models/variants, cells =
+   capable/partial/failed with evidence quotes). With an ensemble, a
+   **consensus tab** shows the rollup: mean scores with spread, consensus
+   rank, per-judge score columns side by side, an agreement statistic, and a
+   dissent list highlighting candidates the judges disagreed on (often the
+   most interesting responses).
 4. Judge prompting: structured-output request (JSON schema / tool-forced
    output) with the anonymized candidates (§5); the free-text reasoning is
    kept as the judge's logged thinking/response, the parsed JSON populates
@@ -609,9 +708,12 @@ recorded history of every other session.
 ### 8.2 Workbench toolset
 
 Everything in §4.4 plus workbench-only tools; crucially, the root agent is
-**not bound by the workspace write-root policy** — it is "root" by title and
-by capability (R10). Its default cwd is its own session directory
-(`data/agent/{session_id}/`) purely for tidiness.
+**not bound by the workspace write-root policy nor by the R13 read
+isolation** — it runs unconfined as the service user. It is "root" by title
+and by capability (R10); the anti-cheating confinement exists to keep
+*competitors* honest, and the root agent competes with no one. Its default
+cwd is its own session directory (`data/agent/{session_id}/`) purely for
+tidiness.
 
 | Tool | Purpose |
 |---|---|
@@ -668,12 +770,24 @@ What gets captured, per artifact class:
 
 Built-in analytics views (v1, read-only dashboards over SQL):
 
-- **Model leaderboard:** mean scores per rubric dimension, win rate (rank 1
-  share), evaluation count, filterable by date/tag.
+- **Model leaderboard:** mean consensus scores per rubric dimension, win rate
+  (consensus-rank-1 share), judge-agreement level, evaluation count,
+  filterable by date/tag/judge; rows are model *variants*, groupable by model.
 - **Domain capability matrix:** aggregate of `domains_capable`/`domains_failed`
   across evaluations → heatmap of model × domain.
+- **Context & memory view (R12):** per model/variant — token rollups (input/
+  output/reasoning/cache, cost) at every grain (run → conversation → model);
+  a **context-utilization curve** (context_used_pct vs. turn_index, with each
+  model's window as its ceiling — a 1M-window model ambles along the floor
+  while a 32k model climbs toward saturation); and a **turn-depth retention
+  curve** plotting evaluation scores against turn_index per model. The
+  retention curve is deliberately *behavioral*: SSM/Mamba-style models have
+  no hard window to fill, so "how well does it remember at turn 20?" is
+  measured by how its judged scores hold up at depth, not by token math —
+  the same curve works for all three architectures side by side.
 - **Ops view:** latency percentiles, failure rates, token/cost totals per
-  endpoint.
+  endpoint; count of blocked cross-workspace read attempts per model (R13's
+  cheating-attempt signal).
 - **Export:** JSONL/CSV per conversation or global; documented schema so
   pandas/DuckDB/notebooks can consume without reading source code.
 
@@ -697,9 +811,15 @@ deployment requirements make that explicit:
   encrypted vault file, are decrypted in-memory per request, and are *not*
   exported into tool subprocess environments (executor spawns tools with a
   scrubbed env). This keeps one model from trivially harvesting the keys used
-  to call its competitors. (A determined model with root can still find ways;
-  the disposable-VM assumption is the real backstop — and `outside_workspace`
-  / audit events make attempts visible.)
+  to call its competitors. Comparison runs are additionally unprivileged
+  (R13), so the vault, DB, and logs are unreadable to them at the filesystem
+  level; the root agent runs unconfined, so the disposable-VM assumption
+  remains the final backstop — and permission-denied / `outside_workspace`
+  audit events make any attempt visible.
+- **Anti-cheating isolation (R13).** Per-run OS users (§4.4) protect
+  *experiment integrity* as well as security: competing models cannot read
+  each other's workspaces, other sessions, or the platform record, and every
+  blocked attempt is a logged, queryable event.
 - **Egress awareness.** Tool-executing models can make arbitrary network
   calls. v1 documents this rather than restricting it (matching R8's "full
   control" intent); an optional egress allowlist at the VM firewall level is
@@ -723,18 +843,22 @@ Each phase is independently shippable and ends with working software.
 Directory layout, FastAPI app + health route, Vite app shell, SQLAlchemy +
 Alembic wired, CI lint/test jobs, `llm-arena/README.md` quickstart.
 
-### Phase 1 — Endpoint registry & vault (R1)
+### Phase 1 — Endpoint registry, vault & capability manifests (R1, R14)
 Endpoint CRUD API + vault; Anthropic and OpenAI/OpenAI-compatible adapters
-with `list_models` + `health_check`; Endpoint Manager UI (add/edit/test/
-enable). **Exit criteria:** add 3+ endpoints incl. a local Ollama, all pass
-live test.
+with `list_models` + `health_check` + `get_capabilities` (static tables +
+provider metadata + probe + manual override, with provenance); Endpoint
+Manager UI (add/edit/test/enable, capability inspector). **Exit criteria:**
+add 3+ endpoints incl. a local Ollama, all pass live test; the manifest for
+each correctly shows which sampling knobs that host exposes.
 
 ### Phase 2 — Broadcast chat & response grid (R2, R3)
 Normalized event schema, `stream_chat` for both adapters (text + usage +
-errors), broadcast orchestrator, SSE endpoint, Composer + EndpointSelector +
+errors), broadcast orchestrator, SSE endpoint, Composer + EndpointSelector
+with **variants** and capability-gated parameter popovers (R14) +
 ResponseGrid with live streaming, cancel, re-run; router shell with a
 **landing-lite** home route (session list with view/continue — R9's skeleton).
 **Exit criteria:** one message fans out to 3 models streaming concurrently;
+a same-model A/B (two system prompts as two variants) runs side by side;
 one endpoint failing doesn't disturb the others; closing the tab and picking
 the session back up from the landing page works.
 
@@ -746,23 +870,29 @@ conversation history reconstruction + replay UI, multi-turn context assembly.
 accurate partial run marked `interrupted`; a DuckDB query over JSONL
 reproduces a full conversation.
 
-### Phase 3.5 — Tool Execution Runtime (R8)
+### Phase 3.5 — Tool Execution Runtime (R8, R13)
 Standard toolset + per-provider tool-def translation, executor with streaming
 output and budgets, per-run workspaces + manifests + `tool_executions` table,
-agentic loop in the orchestrator, tool execution cards + Workspace tab in the
-UI, kill switch, serialized-bash mode, deployment/VM docs + consent flag.
+**per-run OS-user isolation with trusted-mode toggle (R13)**, agentic loop in
+the orchestrator, tool execution cards + Workspace tab in the UI, kill
+switch, serialized-bash mode, deployment/VM docs + consent flag.
 **Exit criteria:** "write and run a script that does X" broadcast to 3 models
 → each autonomously creates and executes files in its own subdirectory, live
 terminal output streams in each panel, manifests attribute every file to the
-right model, and cancel mid-execution kills the process tree.
+right model, cancel mid-execution kills the process tree — and a model
+explicitly instructed to read a competitor's workspace gets permission
+denied, with the attempt visible in the transcript and queryable in the log.
 
-### Phase 4 — Judge & evaluation (R4, R5)
+### Phase 4 — Judge & evaluation (R4, R5, R11)
 Rubric model + default rubric, anonymized judge prompt + structured-output
-parsing, evaluation API + SSE, judge read-only access to anonymized candidate
-workspaces, Evaluate bar, Verdict pane, RankingTable, DomainMatrix,
-`evaluation_results` persistence. **Exit criteria:** select 3
-responses → judged, ranked, domain-mapped verdict rendered and stored; judge
-run itself fully logged.
+parsing, **multi-judge ensembles + repetitions with per-pass order
+re-randomization, consensus rollup + agreement statistics (R11)**, evaluation
+API + SSE, judge read-only access to anonymized candidate workspaces,
+Evaluate bar, Verdict pane with consensus tab, RankingTable, DomainMatrix,
+`evaluation_results`/`evaluation_consensus` persistence. **Exit criteria:**
+select 3 responses → judged by 2 judges × 2 passes → consensus ranking with
+agreement statistic and dissent list rendered and stored; every judge pass
+fully logged.
 
 ### Phase 4.5 — Root Agent & full landing page (R9, R10)
 Agent service (single-endpoint agentic loop reusing the §4.4 runtime, no
@@ -776,10 +906,13 @@ evaluations, write + run an analysis script, and produce a downloadable
 report; the agent session itself is replayable from the landing page.
 
 ### Phase 5 — Analytics, polish & hardening
-Google Gemini adapter; leaderboard + domain heatmap + ops dashboards; JSONL/
-CSV export endpoints; conversation search/tags; keyboard shortcuts; sync-
-scroll; retry policy tuning; docs. **Exit criteria:** the analytics questions
-in §9 answerable from the UI without SQL.
+Google Gemini adapter; leaderboard + domain heatmap + ops dashboards;
+**context & memory view: token rollups, context-utilization curves,
+turn-depth retention curves (R12)**; JSONL/CSV export endpoints; conversation
+search/tags; keyboard shortcuts; sync-scroll; retry policy tuning; docs.
+**Exit criteria:** the analytics questions in §9 answerable from the UI
+without SQL, including "at what turn depth does the 32k model's judged score
+fall off relative to the 1M model?"
 
 Rough sequencing: P0–P1 together first; P2 is the core-value milestone; P3
 before P3.5 (recording must exist before autonomous execution — never run
@@ -803,7 +936,17 @@ depend on faithful records and the tool runtime); P5 iterative.
   truncation, runaway-loop short-circuit, workspace manifest diff accuracy,
   `outside_workspace` flagging, env scrubbing (spawned tool cannot see
   provider keys), concurrent runs writing to sibling workspaces without
-  cross-talk, serialized-bash mutex ordering.
+  cross-talk, serialized-bash mutex ordering; **isolation tests (R13)** — a
+  tool process spawned as run-user A cannot read run-user B's workspace, the
+  DB, JSONL logs, or the vault (assert `EACCES` + the logged event), and
+  trusted mode is recorded on the run.
+- **Capability manifests:** probe-classification tests against fixture hosts
+  that honor, reject, and silently ignore a param; precedence tests
+  (manual > probe > provider_api > static_table); adapter tests asserting
+  unsupported params are never serialized into requests.
+- **Consensus math:** rollup tests over fixture multi-judge results — mean/
+  stddev, consensus rank ties, Kendall's W, dissent detection; order
+  re-randomization across passes actually varies (seeded RNG).
 - **Judge:** verdict-parser tests over fixture judge outputs, incl.
   schema-violating output (graceful degradation: raw text stored, structured
   fields null, UI shows raw).
@@ -818,12 +961,14 @@ depend on faithful records and the tool runtime); P5 iterative.
 |---|---|
 | Provider streaming formats drift | raw payload always stored; adapter fixtures updated per SDK bump; normalized schema is additive-only |
 | Thinking blocks unavailable/redacted on some models | capture what's offered, record `thinking_available: false` capability flag per run — absence is itself analytical data |
-| Judge self-preference bias (judging its own family) | anonymized candidates (§5); analytics can slice results by judge model to expose bias |
+| Judge self-preference bias (judging its own family) | anonymized candidates (§5); multi-judge ensembles + agreement stats (R11) dilute any single judge's bias; analytics can slice results by judge model to expose it |
+| Hosts silently accept-but-ignore unsupported params (the Fireworks-vs-Baseten trap) | capability probing records honored/ignored/rejected per knob with provenance (§4.5); request snapshots preserve exactly what was sent, so "was this setting in effect?" stays answerable |
 | SQLite write contention under many concurrent streams | WAL mode + single writer task consuming an asyncio queue (recorder is already a single funnel) |
-| Context window divergence in long multi-turn comparisons | per-model token accounting shown in panel footer; warn when a model's assembled history nears its limit |
-| Tool calls auto-execute with full VM access (R8) | **Decided.** The VM is the security boundary (dedicated/disposable VM, consent flag, scrubbed subprocess env, egress guidance — §10); per-model workspaces + manifests provide filesystem attribution (§4.4) |
+| Context window divergence in long multi-turn comparisons | first-class now (R12): context-fill gauge per panel, `context_used_pct`/`turn_index` recorded per run, turn-depth retention analytics compare memory behaviorally across 1M/32k/SSM architectures |
+| Tool calls auto-execute with broad system access (R8) | **Decided.** The VM is the security boundary (dedicated/disposable VM, consent flag, scrubbed subprocess env, egress guidance — §10); per-run OS users confine reads (R13) and per-model workspaces + manifests provide filesystem attribution (§4.4) |
 | One model damages the shared VM mid-comparison (kills the backend, fills the disk, breaks the toolchain for others) | Write-ahead recording preserves the record; per-run budgets bound the blast radius; serialized-bash mode for risky workloads; snapshot/restore is the documented recovery path |
-| A model ignores the workspace contract via bash | Not preventable with root by design — detected instead: manifest diffs set `outside_workspace`, surfaced in UI and analytics (itself a useful "instruction-following" signal per model) |
+| A model ignores the workspace contract via bash | Reads of competitor/session data are now *blocked* by OS-user ownership and the attempt logged (R13); writes to world-writable paths like `/tmp` remain possible but are detected — manifest diffs set `outside_workspace`, surfaced in UI and analytics (a useful "instruction-following" signal per model) |
+| Per-user isolation blocks legitimate root needs (global installs) | Pre-provisioned base image + user-space package managers cover most tasks; per-broadcast **trusted mode** (recorded on every run) for the rest (§4.4) |
 | Root agent breaks the platform while self-modifying | Git checkout mandated, commit-per-change on a work branch, graceful `restart_backend` with recorder flush, JSONL history stored outside the app dir (§8.3); worst case is snapshot restore |
 | Build the root agent vs. adopt a harness | **Decided:** self-develop on the §4.4 runtime (endpoint-agnostic, one logging pipeline); borrow tool/prompt designs from OpenHands; optional v2 `external_harness` endpoint type wrapping Claude Code headless (§8.1) |
 | Multi-user later? | **Open** — schema has no user column yet; adding `owner_id` to `conversations`/`endpoints` is a small migration. Deferred deliberately. |
