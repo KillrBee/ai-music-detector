@@ -16,7 +16,11 @@ responses against each other, ranks them, and identifies the domains where each
 model succeeded or failed. Models don't just talk: tool calls **execute
 autonomously** with full access to the host VM, each model working inside its
 own subdirectory under the conversation's directory, so comparisons cover real
-agentic work — not just prose. **Everything** — user prompts, system prompts, tool
+agentic work — not just prose. Alongside the comparison surface sits a
+**root agent**: a single-endpoint agentic chat with unrestricted tools that
+can write code, inspect results, and analyze anything the platform has
+recorded — including cross-comparing past sessions. A landing page lists every
+session for pick-up, viewing, or continuation. **Everything** — user prompts, system prompts, tool
 calls and results, thinking/reasoning blocks, streamed deltas, final responses,
 judge verdicts, token usage, latency — is durably logged, keyed by conversation
 ID and tagged with model name + version, in a schema designed for downstream
@@ -34,6 +38,8 @@ analytical processing.
 | R6 | All artifacts logged and stored by conversation ID, tagged with model name and version |
 | R7 | Full-fidelity record: user prompts, system prompts, tool calls, tool results, thinking blocks, final responses — queryable for analytics |
 | R8 | Tool calls execute autonomously (no user in the loop); each LLM has full access to the host VM but works inside its own subdirectory under the conversation directory |
+| R9 | Landing page listing every session (comparison conversations and agent sessions) to pick, view, or continue |
+| R10 | A **root agent**: a standalone chat interface bound to one user-selectable endpoint, with full tool access — writes code, makes and inspects changes, cross-compares sessions, analyzes any data in the system; self-developed or built on an existing open-source harness |
 
 ### Non-goals (v1)
 
@@ -159,24 +165,29 @@ llm-arena/
 │   │   │   └── builtins/            # bash.py, read_file.py, write_file.py, web_fetch.py
 │   │   ├── services/
 │   │   │   ├── broadcast.py         # agentic fan-out orchestrator (asyncio.TaskGroup)
+│   │   │   ├── agent.py             # root agent loop (single endpoint, workbench tools)
 │   │   │   ├── recorder.py          # event persistence (DB + JSONL)
 │   │   │   ├── evaluation.py        # judge pipeline, rubric prompts, verdict parsing
 │   │   │   ├── vault.py             # Fernet-encrypted credential store
 │   │   │   └── costing.py           # token→cost estimation tables
 │   │   ├── routers/
 │   │   │   ├── endpoints.py         # /api/endpoints CRUD + test
-│   │   │   ├── conversations.py     # /api/conversations, messages, history
+│   │   │   ├── conversations.py     # /api/conversations (both kinds), messages, history
 │   │   │   ├── broadcasts.py        # /api/broadcasts + SSE stream
+│   │   │   ├── agent.py             # /api/agent sessions + SSE stream
 │   │   │   ├── evaluations.py       # /api/evaluations + SSE stream
 │   │   │   └── analytics.py         # /api/analytics/* + exports
 │   │   └── schemas/                 # Pydantic request/response DTOs
 │   └── tests/
 ├── frontend/
 │   ├── src/
-│   │   ├── App.tsx
+│   │   ├── App.tsx                  # react-router shell: / (landing), /compare/:id, /agent/:id
 │   │   ├── api/                     # typed client + SSE hooks
 │   │   ├── state/                   # Zustand stores (see §7)
+│   │   ├── pages/                   # LandingPage, ComparePage, AgentPage, AnalyticsPage
 │   │   ├── components/
+│   │   │   ├── landing/             # SessionCard, SessionGrid, NewSessionMenu
+│   │   │   ├── agent/               # AgentConsole, AgentTranscript, EndpointSwitcher
 │   │   │   ├── endpoints/           # EndpointManager, EndpointForm, ModelPicker
 │   │   │   ├── chat/                # Composer, SystemPromptEditor, EndpointSelector
 │   │   │   ├── responses/           # ResponseGrid, ResponsePanel, ThinkingBlock,
@@ -342,7 +353,9 @@ endpoints(
 )
 
 conversations(
-  id UUID PK, title TEXT, system_prompt TEXT,              -- active system prompt (also logged per-run)
+  id UUID PK, kind TEXT,                                   -- 'comparison' | 'agent'  (R9/R10 sessions share one table)
+  title TEXT, system_prompt TEXT,                          -- active system prompt (also logged per-run)
+  agent_endpoint_id FK NULL, agent_model TEXT NULL,        -- kind='agent': the bound endpoint (switchable, logged per-run)
   created_at, updated_at, archived BOOL, metadata JSON     -- free-form tags for analytics
 )
 
@@ -434,8 +447,11 @@ results are de-anonymized for display and analytics.
 | `GET/POST/PATCH/DELETE /api/endpoints` | Endpoint CRUD (R1) |
 | `POST /api/endpoints/{id}/test` | Live health check + model listing |
 | `GET /api/endpoints/{id}/models` | Enumerate models on that endpoint |
-| `GET/POST /api/conversations` | Create/list conversations |
+| `GET/POST /api/conversations` | Create/list sessions of both kinds (`?kind=comparison\|agent`, sort by last activity) — backs the landing page (R9) |
 | `GET /api/conversations/{id}` | Full reconstructed transcript (all runs, all events) |
+| `POST /api/agent/sessions` | Create a root-agent session `{endpoint_id, model, system_prompt?}` (R10) |
+| `POST /api/agent/sessions/{id}/messages` | Send a user turn to the root agent (also switches endpoint/model if provided) |
+| `GET /api/agent/sessions/{id}/stream` | SSE of the agent's run (same normalized events as broadcasts) |
 | `PATCH /api/conversations/{id}` | Title, system prompt, tags, archive |
 | `POST /api/broadcasts` | `{conversation_id, message, endpoint_selections:[{endpoint_id, model, params}]}` → creates broadcast + N runs, returns ids immediately (R2) |
 | `GET /api/broadcasts/{id}/stream` | **SSE**: multiplexed normalized events for all runs in the broadcast (R3) |
@@ -470,7 +486,35 @@ results are de-anonymized for display and analytics.
 
 ## 7. Frontend Design
 
-### Layout (single page, three zones)
+Three routes behind a `react-router` shell: `/` (landing), `/compare/:id`
+(the comparison surface below), `/agent/:id` (root agent console, §8).
+
+### Landing page (R9)
+
+The home route is a session picker, not a chat:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  LLM Arena          [+ New Comparison] [+ New Agent Session] [⚙ ▾]   │
+├──────────────────────────────────────────────────────────────────────┤
+│  Search sessions…                 [All | Comparisons | Agent] [Tags▾] │
+│  ┌───────────────────────────┐  ┌───────────────────────────┐        │
+│  │ ⚖ Prompt-injection tests  │  │ 🤖 Refactor detector CLI  │        │
+│  │ 3 models · 12 turns       │  │ agent · claude-sonnet-5   │        │
+│  │ ★ winner: gpt-5.2 (8.7)   │  │ 41 tool calls · 2 files   │        │
+│  │ 2h ago    [View][Continue]│  │ 1d ago    [View][Continue]│        │
+│  └───────────────────────────┘  └───────────────────────────┘        │
+│  …                                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Each card shows kind, title, participating models (or the agent's endpoint),
+turn/tool counts, latest evaluation outcome for comparisons, tags, and last
+activity. **View** opens read-only replay; **Continue** resumes the session
+live (comparison composer or agent console). Global entries for the Endpoint
+Manager and Analytics dashboards live in the header.
+
+### Comparison surface (layout, three zones)
 
 ```
 ┌─────────────┬──────────────────────────────────────────────────────┐
@@ -543,7 +587,67 @@ from `GET /api/conversations/{id}` — streaming and replay share one code path.
 
 ---
 
-## 8. Logging & Analytics (R6/R7 deep-dive)
+## 8. Root Agent (R10)
+
+A standalone agentic chat console, deliberately *outside* the broadcast/
+comparison flow: one session ↔ one user-selectable endpoint+model
+(switchable mid-session; every run records which endpoint served it). It is
+the platform's general-purpose workbench — write and run code, modify this
+very application, inspect and post-process results, and interrogate the
+recorded history of every other session.
+
+### 8.1 Build vs. reuse
+
+| Option | Fit | Verdict |
+|---|---|---|
+| **Self-develop on our §4.4 runtime** | By Phase 3.5 we already have provider adapters, an agentic loop, a tool executor, and the recorder. The root agent is the same loop with a broader tool scope and no write-root policy. Endpoint-agnostic by construction; logs into the same event schema for free. | **Recommended.** Marginal cost is small; one logging pipeline; no provider lock-in. |
+| Claude Agent SDK | Production-grade agent loop + tools (the machinery behind Claude Code); headless/embedded modes. But Anthropic-family models only — conflicts with "single *user-selectable* endpoint" — and its transcripts would need bridging into our event schema. | Not the foundation. **v2 option:** an `external_harness` endpoint type that drives Claude Code headless and ingests its JSON transcript as events — gives a best-in-class agent for Anthropic-backed sessions without changing our record model. |
+| OpenHands | Multi-provider (LiteLLM), full agent + sandboxed runtime + UI. Closest existing product, but it *is* a product: embedding means adopting its runtime, event model, and UI, then bridging everything back into ours. | Don't embed. **Borrow from it**: tool schemas, system-prompt patterns, and its event-stream design are good prior art (MIT-licensed). |
+| Aider | Multi-provider pair-programming CLI, excellent git-diff discipline. Scoped to code editing, not general tool use; terminal UX doesn't embed cleanly. | No — but adopt its practice of committing after each agent change (see 8.3). |
+| LangGraph / smolagents | Loop-orchestration libraries; we'd still write the tools, capture, and UI ourselves. | Unnecessary abstraction over an `async while` loop we already have. |
+
+### 8.2 Workbench toolset
+
+Everything in §4.4 plus workbench-only tools; crucially, the root agent is
+**not bound by the workspace write-root policy** — it is "root" by title and
+by capability (R10). Its default cwd is its own session directory
+(`data/agent/{session_id}/`) purely for tidiness.
+
+| Tool | Purpose |
+|---|---|
+| `bash`, `read_file`, `write_file`, `edit_file`, `list_dir`, `web_fetch` | As §4.4, unrestricted paths |
+| `arena_sql` | Read-only SQL over the arena database — the entire analytical record (§5) is queryable in-chat ("which model had the most `outside_workspace` flags?", "rank win-rates on coding tasks") |
+| `list_sessions` / `read_session` | Structured access to any conversation's reconstructed transcript, incl. thinking blocks and judge verdicts — cross-session comparison without SQL |
+| `read_workspace` | Browse/read any session's workspace artifacts |
+| `export_report` | Write an analysis artifact into its session directory and surface it as a downloadable card in the console |
+
+### 8.3 Self-modification discipline
+
+The root agent can edit the platform's own code (it has root on the VM — this
+is a feature, per R10). Guardrails are process, not permission:
+
+- The deployment doc mandates the app directory be a **git checkout**; the
+  agent's system prompt instructs commit-per-change on a work branch, so every
+  self-modification is diffable and revertible.
+- A `restart_backend` tool performs a graceful restart (recorder flushes
+  first) so agent-made backend changes can be applied and then verified by the
+  agent itself; the frontend dev server hot-reloads.
+- The recorder's JSONL mirror lives outside the app dir and is append-only —
+  even a botched self-modification can't silently rewrite history.
+
+### 8.4 Console UI & capture
+
+`AgentPage` reuses the `ResponsePanel` machinery (§7) as a single full-width
+transcript: thinking blocks, live tool terminals, file-touched chips, and an
+`EndpointSwitcher` in the header. Sessions are `conversations` rows with
+`kind='agent'`; turns are `runs`; every event flows through the same recorder —
+so R6/R7 logging, replay from the landing page, and analytics coverage apply
+to agent sessions identically, and agent sessions appear on the model
+leaderboard's ops metrics like any other run.
+
+---
+
+## 9. Logging & Analytics (R6/R7 deep-dive)
 
 What gets captured, per artifact class:
 
@@ -575,7 +679,7 @@ Built-in analytics views (v1, read-only dashboards over SQL):
 
 ---
 
-## 9. Security & Privacy
+## 10. Security & Privacy
 
 **Threat model (changed by R8):** with autonomous tool execution, every
 connected model effectively has shell access to the host. The application does
@@ -611,7 +715,7 @@ deployment requirements make that explicit:
 
 ---
 
-## 10. Phased Delivery Plan
+## 11. Phased Delivery Plan
 
 Each phase is independently shippable and ends with working software.
 
@@ -628,9 +732,11 @@ live test.
 ### Phase 2 — Broadcast chat & response grid (R2, R3)
 Normalized event schema, `stream_chat` for both adapters (text + usage +
 errors), broadcast orchestrator, SSE endpoint, Composer + EndpointSelector +
-ResponseGrid with live streaming, cancel, re-run. **Exit criteria:** one
-message fans out to 3 models streaming concurrently; one endpoint failing
-doesn't disturb the others.
+ResponseGrid with live streaming, cancel, re-run; router shell with a
+**landing-lite** home route (session list with view/continue — R9's skeleton).
+**Exit criteria:** one message fans out to 3 models streaming concurrently;
+one endpoint failing doesn't disturb the others; closing the tab and picking
+the session back up from the landing page works.
 
 ### Phase 3 — Full-fidelity recording (R6, R7)
 Event Recorder (DB + JSONL), request snapshots, thinking-block capture
@@ -658,20 +764,31 @@ workspaces, Evaluate bar, Verdict pane, RankingTable, DomainMatrix,
 responses → judged, ranked, domain-mapped verdict rendered and stored; judge
 run itself fully logged.
 
+### Phase 4.5 — Root Agent & full landing page (R9, R10)
+Agent service (single-endpoint agentic loop reusing the §4.4 runtime, no
+write-root policy), workbench tools (`arena_sql`, `list_sessions`/
+`read_session`, `read_workspace`, `export_report`, `restart_backend`),
+`kind='agent'` sessions + agent API + SSE, AgentPage console with
+EndpointSwitcher, landing page upgraded to full session cards (eval outcomes,
+tool counts, tags, search/filter). **Exit criteria:** from the landing page,
+open an agent session, have it query the arena DB to rank models from prior
+evaluations, write + run an analysis script, and produce a downloadable
+report; the agent session itself is replayable from the landing page.
+
 ### Phase 5 — Analytics, polish & hardening
 Google Gemini adapter; leaderboard + domain heatmap + ops dashboards; JSONL/
 CSV export endpoints; conversation search/tags; keyboard shortcuts; sync-
 scroll; retry policy tuning; docs. **Exit criteria:** the analytics questions
-in §8 answerable from the UI without SQL.
+in §9 answerable from the UI without SQL.
 
 Rough sequencing: P0–P1 together first; P2 is the core-value milestone; P3
 before P3.5 (recording must exist before autonomous execution — never run
-unlogged tools) and both before P4 (the judge depends on faithful records and
-artifacts); P5 iterative.
+unlogged tools) and both before P4 and P4.5 (the judge and the root agent both
+depend on faithful records and the tool runtime); P5 iterative.
 
 ---
 
-## 11. Testing Strategy
+## 12. Testing Strategy
 
 - **Adapters:** unit tests against recorded provider fixtures (streaming
   chunk sequences incl. thinking, tool calls, malformed/interleaved chunks,
@@ -695,7 +812,7 @@ artifacts); P5 iterative.
 
 ---
 
-## 12. Risks & Open Questions
+## 13. Risks & Open Questions
 
 | Risk / question | Mitigation / proposed default |
 |---|---|
@@ -704,16 +821,18 @@ artifacts); P5 iterative.
 | Judge self-preference bias (judging its own family) | anonymized candidates (§5); analytics can slice results by judge model to expose bias |
 | SQLite write contention under many concurrent streams | WAL mode + single writer task consuming an asyncio queue (recorder is already a single funnel) |
 | Context window divergence in long multi-turn comparisons | per-model token accounting shown in panel footer; warn when a model's assembled history nears its limit |
-| Tool calls auto-execute with full VM access (R8) | **Decided.** The VM is the security boundary (dedicated/disposable VM, consent flag, scrubbed subprocess env, egress guidance — §9); per-model workspaces + manifests provide filesystem attribution (§4.4) |
+| Tool calls auto-execute with full VM access (R8) | **Decided.** The VM is the security boundary (dedicated/disposable VM, consent flag, scrubbed subprocess env, egress guidance — §10); per-model workspaces + manifests provide filesystem attribution (§4.4) |
 | One model damages the shared VM mid-comparison (kills the backend, fills the disk, breaks the toolchain for others) | Write-ahead recording preserves the record; per-run budgets bound the blast radius; serialized-bash mode for risky workloads; snapshot/restore is the documented recovery path |
 | A model ignores the workspace contract via bash | Not preventable with root by design — detected instead: manifest diffs set `outside_workspace`, surfaced in UI and analytics (itself a useful "instruction-following" signal per model) |
+| Root agent breaks the platform while self-modifying | Git checkout mandated, commit-per-change on a work branch, graceful `restart_backend` with recorder flush, JSONL history stored outside the app dir (§8.3); worst case is snapshot restore |
+| Build the root agent vs. adopt a harness | **Decided:** self-develop on the §4.4 runtime (endpoint-agnostic, one logging pipeline); borrow tool/prompt designs from OpenHands; optional v2 `external_harness` endpoint type wrapping Claude Code headless (§8.1) |
 | Multi-user later? | **Open** — schema has no user column yet; adding `owner_id` to `conversations`/`endpoints` is a small migration. Deferred deliberately. |
 | Same repo or split out? | Start in `llm-arena/` here; it shares nothing with the audio detector at runtime, so extraction later is `git filter-repo`-trivial. |
 
 ---
 
-## 13. Immediate Next Steps
+## 14. Immediate Next Steps
 
-1. Review/approve this plan (esp. §12 open questions and the SQLite default).
+1. Review/approve this plan (esp. §13 open questions and the SQLite default).
 2. Phase 0 scaffold PR.
 3. Phase 1: vault + Anthropic/OpenAI adapters + Endpoint Manager.
