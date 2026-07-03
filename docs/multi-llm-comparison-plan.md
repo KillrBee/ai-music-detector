@@ -13,7 +13,10 @@ simultaneously**. One chat box broadcasts a message to every selected endpoint;
 each model's response renders in its own panel. Selected responses can be sent
 to a "judge" LLM that evaluates quality, accuracy, and completeness, compares
 responses against each other, ranks them, and identifies the domains where each
-model succeeded or failed. **Everything** — user prompts, system prompts, tool
+model succeeded or failed. Models don't just talk: tool calls **execute
+autonomously** with full access to the host VM, each model working inside its
+own subdirectory under the conversation's directory, so comparisons cover real
+agentic work — not just prose. **Everything** — user prompts, system prompts, tool
 calls and results, thinking/reasoning blocks, streamed deltas, final responses,
 judge verdicts, token usage, latency — is durably logged, keyed by conversation
 ID and tagged with model name + version, in a schema designed for downstream
@@ -30,11 +33,12 @@ analytical processing.
 | R5 | Judge evaluates quality, accuracy, completeness; compares responses to each other; ranks them; maps domain capabilities and failures per model |
 | R6 | All artifacts logged and stored by conversation ID, tagged with model name and version |
 | R7 | Full-fidelity record: user prompts, system prompts, tool calls, tool results, thinking blocks, final responses — queryable for analytics |
+| R8 | Tool calls execute autonomously (no user in the loop); each LLM has full access to the host VM but works inside its own subdirectory under the conversation directory |
 
 ### Non-goals (v1)
 
 - Multi-user auth / teams / RBAC (design leaves room for it; don't build it)
-- Fine-tuning, RAG pipelines, or agentic tool execution beyond logging what models emit
+- Fine-tuning or RAG pipelines
 - Mobile-native apps (responsive web only)
 - Billing management for provider accounts (we *record* cost estimates only)
 
@@ -54,12 +58,17 @@ Tailwind frontend) so tooling, linting, and deployment knowledge transfer direct
 │  └──────────┘ └───────────────┘ └───────────┘ └────────────────┘  │
 │         REST (CRUD, history)  +  SSE (streaming deltas)            │
 ├────────────────────────────────────────────────────────────────────┤
-│  Backend (FastAPI, async)                                          │
+│  Backend (FastAPI, async) — runs on a dedicated/disposable VM      │
 │  ┌───────────────┐  ┌──────────────┐  ┌──────────────────────┐    │
 │  │ Provider       │  │ Broadcast    │  │ Evaluation Service   │    │
 │  │ Registry +     │  │ Orchestrator │  │ (judge pipeline)     │    │
-│  │ Adapters       │  │ (fan-out)    │  │                      │    │
-│  └───────┬────────┘  └──────┬───────┘  └──────────┬───────────┘    │
+│  │ Adapters       │  │ (agentic     │  │                      │    │
+│  └───────┬────────┘  │  fan-out)    │  └──────────┬───────────┘    │
+│          │           └──────┬───────┘             │                │
+│  ┌───────┴──────────────────┴─────────────────────┴────────────┐  │
+│  │ Tool Execution Runtime — full VM access, per-run workspaces │  │
+│  │ data/conversations/{conv_id}/{model-slug}/                  │  │
+│  └──────────────────────────────────────────────────────────────┘ │
 │          └── normalized event stream ─────────────┘                │
 │  ┌────────────────────────────────────────────────────────────┐   │
 │  │ Event Recorder → SQLite (WAL) via SQLAlchemy + raw JSONL   │   │
@@ -106,7 +115,17 @@ Tailwind frontend) so tooling, linting, and deployment knowledge transfer direct
    `status = 'interrupted'` marker — no "the log is whatever the UI happened
    to show" problem.
 
-5. **The judge is just another endpoint.** Evaluations are dispatched through
+5. **Autonomous tool execution; the VM is the sandbox.** Models don't just
+   *emit* tool calls — the backend executes them and loops until the model
+   finishes (an agentic loop per run, like a coding agent). Tools run with
+   the backend's own privileges, i.e. full access to the host, so the
+   deployment assumption is a **dedicated, disposable virtual machine**: the
+   isolation boundary is the VM, not the application. Filesystem hygiene
+   between concurrently-running models comes from **per-run workspaces**
+   (`data/conversations/{conversation_id}/{model-slug}/`) — each model's cwd
+   and instructed write-root is its own subdirectory. See §4.4.
+
+6. **The judge is just another endpoint.** Evaluations are dispatched through
    the same adapter/recorder machinery as chat broadcasts, so judge prompts,
    judge thinking blocks, and judge outputs are logged with the same fidelity
    and tagged to the same conversation ID (R6/R7 apply to the judge too).
@@ -133,8 +152,13 @@ llm-arena/
 │   │   │   ├── openai_adapter.py    # also serves all OpenAI-compatible endpoints
 │   │   │   ├── google_adapter.py
 │   │   │   └── registry.py          # endpoint CRUD, health checks, model listing
+│   │   ├── tools/
+│   │   │   ├── registry.py          # standard toolset + per-provider tool-def translation
+│   │   │   ├── executor.py          # runs tool calls, streams output, enforces budgets
+│   │   │   ├── workspace.py         # per-run workspace creation, manifest, diff snapshots
+│   │   │   └── builtins/            # bash.py, read_file.py, write_file.py, web_fetch.py
 │   │   ├── services/
-│   │   │   ├── broadcast.py         # fan-out orchestrator (asyncio.TaskGroup)
+│   │   │   ├── broadcast.py         # agentic fan-out orchestrator (asyncio.TaskGroup)
 │   │   │   ├── recorder.py          # event persistence (DB + JSONL)
 │   │   │   ├── evaluation.py        # judge pipeline, rubric prompts, verdict parsing
 │   │   │   ├── vault.py             # Fernet-encrypted credential store
@@ -193,9 +217,10 @@ Each adapter is responsible for:
   (Anthropic extended thinking, OpenAI reasoning summaries, DeepSeek-style
   `reasoning_content` on OpenAI-compatible endpoints) and emitting them as
   first-class events rather than discarding them;
-- surfacing **tool-use requests** emitted by the model as events (v1 does not
-  auto-execute tools; the UI shows the call and the user can supply a result
-  or skip — but the *capture* is lossless either way);
+- surfacing **tool-use requests** emitted by the model as events; the
+  orchestrator hands them to the Tool Execution Runtime (§4.4), and the
+  adapter feeds the results back into the provider's continuation format —
+  the loop runs without user involvement;
 - attaching the **raw provider payload** to every event for archival.
 
 ### 4.2 Normalized event types
@@ -209,7 +234,8 @@ the streamer, the recorder, the UI, and the analytics layer all consume it.
 | `text_delta` | incremental assistant text |
 | `thinking_delta` | incremental reasoning/thinking text (+ signature/redaction flags) |
 | `tool_call` | tool name, call id, full arguments JSON |
-| `tool_result` | call id, result content (user-supplied in v1) |
+| `tool_output_delta` | incremental stdout/stderr while a tool executes (live terminal feel) |
+| `tool_result` | call id, final result content, exit code, duration, truncation flag |
 | `usage` | input/output/cache/reasoning token counts |
 | `run_completed` | stop reason, latency ms, final assembled text |
 | `run_failed` | error class (auth / rate-limit / timeout / provider error), message, retryable flag |
@@ -230,6 +256,72 @@ distinguishable in analytics.
 - Request snapshots stored in the log are **scrubbed** of `Authorization` /
   `x-api-key` headers before persistence (log fidelity applies to content,
   never to secrets).
+
+### 4.4 Tool Execution Runtime (R8)
+
+Every run is an **agentic loop**: adapter streams model output → model emits
+tool calls → executor runs them → results are appended to the run's message
+history → the adapter continues the request — repeated until the model stops
+without tool calls or a budget trips. No user interaction anywhere in the loop.
+
+**Standard toolset** (defined once, translated into each provider's tool-def
+format by the registry so every model gets functionally identical tools):
+
+| Tool | Behavior |
+|---|---|
+| `bash` | Execute a shell command on the VM. Runs as the backend's user (full system access by design). `cwd` defaults to the run's workspace. Streams stdout/stderr as `tool_output_delta` events; captures exit code. Per-call timeout (default 120 s, model can request up to a cap). |
+| `read_file` | Read any path on the VM (full read access). |
+| `write_file` / `edit_file` | Write/edit files. Paths resolve relative to the run's workspace; absolute paths **outside** the workspace are allowed only when `allow_outside_workspace` is enabled on the endpoint config (default **off** — see write-root policy below). |
+| `list_dir` | Directory listing. |
+| `web_fetch` | HTTP GET with size cap (models on the VM can also just `curl` via bash; this exists as a cheaper structured path). |
+
+**Workspace layout & write-root policy.** Each conversation gets a directory;
+each run's model gets its own subdirectory beneath it:
+
+```
+data/conversations/{conversation_id}/
+├── shared/                        # user-provided input files, visible to all models
+├── claude-sonnet-5/               # {model-slug}: one workspace per endpoint+model
+│   ├── .runs/{run_id}.manifest    # files created/modified per run (workspace diff)
+│   └── … model's own artifacts …
+├── gpt-5.2/
+└── llama-4-local/
+```
+
+- Workspace slug = endpoint name + model, stable across turns of the same
+  conversation, so a model's turn 5 can build on files it wrote in turn 2.
+- Every model's system prompt is injected with a **workspace contract**: its
+  absolute workspace path, an instruction that all artifacts must be created
+  under it, and a note that `shared/` is read-only common input.
+- Enforcement is layered: `read` is unrestricted (full VM access per R8);
+  structured `write_file`/`edit_file` calls are *path-checked* against the
+  workspace by default; `bash` is uncheckable by nature (root access is the
+  requirement), so bash relies on the contract + cwd defaulting — and the
+  **workspace manifest** (filesystem snapshot diff per tool call, recorded as
+  part of `tool_result`) makes any out-of-workspace writes visible after the
+  fact rather than silently lost.
+
+**Budgets & safety valves** (per run, configurable per endpoint):
+max agentic iterations (default 25), max total tool-execution wall time
+(default 15 min), max output bytes per tool call (default 1 MiB, truncated
+with marker), and a global **kill switch** (`POST /api/runs/{id}/cancel`
+terminates the process group of any in-flight tool). Runaway detection: N
+identical consecutive tool calls short-circuits with an error result.
+
+**Concurrency model.** N models execute tools on the same VM simultaneously.
+File-level collisions are prevented by per-model workspaces; *system-level*
+collisions (apt/pip installs, port binding, killing processes) are not
+preventable when everyone has root — mitigations: (a) system prompt contract
+asks models to prefer virtualenvs and ephemeral ports, (b) an optional
+**serialized-bash mode** per broadcast (global mutex on `bash`) for workloads
+where interference is likely, (c) the deployment doc mandates a disposable VM
+snapshot/restore workflow so a trashed machine is a reset, not an incident.
+
+**Capture.** Every execution is recorded: the call args, cwd, start/end
+timestamps, exit code, full stdout/stderr (up to cap, with truncation
+markers), and the workspace manifest diff — all as `events` rows tagged to the
+run, satisfying R7 for the tool dimension. Artifacts themselves stay on disk
+in the workspace and are browsable/downloadable from the UI.
 
 ---
 
@@ -268,7 +360,9 @@ runs(
   endpoint_id FK→endpoints,
   model_requested TEXT, model_resolved TEXT,               -- name + version tags (R6)
   params JSON, request_snapshot JSON,                      -- full scrubbed outbound payload
-  status TEXT,                                             -- pending|streaming|completed|failed|interrupted|cancelled
+  status TEXT,                                             -- pending|streaming|executing_tools|completed|failed|interrupted|cancelled
+  workspace_path TEXT,                                     -- data/conversations/{conv}/{model-slug}
+  tool_iterations INT,                                     -- agentic loop count
   stop_reason TEXT, latency_ms INT,
   input_tokens INT, output_tokens INT, reasoning_tokens INT,
   cache_read_tokens INT, cost_estimate_usd NUMERIC,
@@ -286,6 +380,18 @@ events(
   content JSON,      -- normalized payload
   raw JSON,          -- verbatim provider chunk/payload (nullable for user events)
   created_at TIMESTAMP
+)
+
+-- Structured record of every autonomous tool execution (R8) — the same data
+-- also flows through `events`; this table is the analytics-friendly rollup
+tool_executions(
+  id UUID PK, run_id FK→runs, conversation_id FK,
+  tool_name TEXT, call_id TEXT, arguments JSON,
+  cwd TEXT, exit_code INT, duration_ms INT,
+  stdout_bytes INT, stderr_bytes INT, truncated BOOL,
+  files_created JSON, files_modified JSON,                 -- workspace manifest diff
+  outside_workspace BOOL,                                  -- diff touched paths outside the run's dir
+  started_at, completed_at
 )
 
 -- Judge workflow (R4/R5)
@@ -333,8 +439,10 @@ results are de-anonymized for display and analytics.
 | `PATCH /api/conversations/{id}` | Title, system prompt, tags, archive |
 | `POST /api/broadcasts` | `{conversation_id, message, endpoint_selections:[{endpoint_id, model, params}]}` → creates broadcast + N runs, returns ids immediately (R2) |
 | `GET /api/broadcasts/{id}/stream` | **SSE**: multiplexed normalized events for all runs in the broadcast (R3) |
-| `POST /api/runs/{id}/cancel` | Cancel one in-flight run |
-| `POST /api/runs/{id}/tool-result` | Supply a manual tool result and resume the run |
+| `POST /api/runs/{id}/cancel` | Cancel one in-flight run (kills any executing tool's process group) |
+| `GET /api/conversations/{id}/workspace?path=…` | Browse the conversation directory tree (shared + per-model subdirs) |
+| `GET /api/conversations/{id}/workspace/file?path=…` | Download/preview a workspace artifact |
+| `GET /api/runs/{id}/tools` | Structured tool-execution log for a run (`tool_executions` rows) |
 | `POST /api/evaluations` | `{broadcast_id, candidate_run_ids, judge_endpoint_id, judge_model, rubric?}` (R4) |
 | `GET /api/evaluations/{id}/stream` | SSE of the judge run (thinking + verdict as it forms) |
 | `GET /api/evaluations/{id}` | Parsed structured verdict (R5) |
@@ -343,9 +451,14 @@ results are de-anonymized for display and analytics.
 
 ### Broadcast orchestrator behavior
 
-- `asyncio.TaskGroup`; one task per run; per-run timeout (configurable,
-  default 300 s) and independent failure — one provider melting down never
+- `asyncio.TaskGroup`; one task per run; each task drives that run's full
+  **agentic loop** (stream → execute tools → continue) with per-run budgets
+  from §4.4 on top of a per-request timeout (default 300 s). Independent
+  failure — one provider melting down or one model stuck in a tool loop never
   blocks the others' panels.
+- Before dispatch, the orchestrator ensures the conversation directory and
+  each selected model's workspace subdirectory exist, and injects the
+  workspace contract into each model's system prompt.
 - Conversation history sent to each model is that model's *own* prior turns
   in the conversation plus shared user turns (each endpoint sees a coherent
   bilateral conversation, not the other models' answers), assembled from the
@@ -381,11 +494,19 @@ results are de-anonymized for display and analytics.
 ### Response panel anatomy (R3, R7 visibility)
 
 Each `ResponsePanel` renders, in stream order: collapsible **thinking block**
-(distinct styling, collapsed by default once final text starts), **tool call
-cards** (name + syntax-highlighted args + result-entry affordance), markdown
-final text, and a footer with latency / token counts / cost estimate / model
-version chip / status. Panel actions: select-for-evaluation checkbox, copy,
-re-run, cancel, expand to full screen, view raw request/response JSON.
+(distinct styling, collapsed by default once final text starts), **tool
+execution cards** (tool name + syntax-highlighted args + a live mini-terminal
+streaming stdout/stderr via `tool_output_delta`, then exit code, duration, and
+files-touched chips), markdown final text, and a footer with latency / token
+counts / cost estimate / tool-iteration count / model version chip / status.
+Panel actions: select-for-evaluation checkbox, copy, re-run, cancel (kills
+in-flight tools), expand to full screen, open workspace folder, view raw
+request/response JSON.
+
+A **Workspace tab** per conversation shows the directory tree
+(`shared/` + one subdirectory per model) with file preview/download, so
+artifacts the models produced are inspectable next to their transcripts —
+and can be eyeballed when judging (see below).
 
 Grid is responsive: 1–2 columns on narrow screens, up to 4 wide; panels are
 individually scrollable with synchronized-scroll toggle for side-by-side
@@ -407,6 +528,10 @@ reading.
    output) with the anonymized candidates (§5); the free-text reasoning is
    kept as the judge's logged thinking/response, the parsed JSON populates
    `evaluation_results`.
+5. When candidate runs produced workspace artifacts, the judge gets read-only
+   `read_file`/`list_dir` tools scoped to anonymized copies of the candidate
+   workspaces, so it can verify that produced code/files actually work as
+   claimed — not just grade the prose.
 
 ### State management
 
@@ -428,7 +553,8 @@ What gets captured, per artifact class:
 | System prompts | `broadcasts.system_prompt_snapshot` + per-run `request_snapshot` | frozen as-sent, even if edited later |
 | Full outbound request | `runs.request_snapshot` | scrubbed of credentials |
 | Thinking blocks | `thinking_delta`/`thinking_final` events | raw provider form preserved in `raw` |
-| Tool calls & results | `tool_call`/`tool_result` events | args verbatim |
+| Tool calls & results | `tool_call`/`tool_output_delta`/`tool_result` events + `tool_executions` table | args, full stdout/stderr, exit codes, durations, workspace file diffs |
+| Workspace artifacts | `data/conversations/{conv}/{model-slug}/` on disk + per-run manifests | browsable in UI, included in export bundles |
 | Streamed deltas | `text_delta` events | reconstructable typing timeline (inter-token latency analysis) |
 | Final responses | `text_final` + `runs` terminal fields | |
 | Errors/retries | `error` events + `runs.status` | error taxonomy for reliability analytics |
@@ -451,13 +577,37 @@ Built-in analytics views (v1, read-only dashboards over SQL):
 
 ## 9. Security & Privacy
 
+**Threat model (changed by R8):** with autonomous tool execution, every
+connected model effectively has shell access to the host. The application does
+not pretend to sandbox this — **the VM is the security boundary**, and the
+deployment requirements make that explicit:
+
+- **Dedicated, disposable VM only.** Documented as a hard requirement: fresh
+  VM or snapshot per project, nothing of value on the machine beyond the
+  `data/` directory (which should be backed up/synced off-box), restore from
+  snapshot when a model trashes the environment. Never run the backend on a
+  workstation or shared server. A startup banner + config flag
+  (`I_UNDERSTAND_TOOLS_HAVE_FULL_VM_ACCESS=1`) makes this consent explicit.
+- **Credential hygiene matters more, not less.** Models with shell access can
+  read the process environment and disk — so provider keys live only in the
+  encrypted vault file, are decrypted in-memory per request, and are *not*
+  exported into tool subprocess environments (executor spawns tools with a
+  scrubbed env). This keeps one model from trivially harvesting the keys used
+  to call its competitors. (A determined model with root can still find ways;
+  the disposable-VM assumption is the real backstop — and `outside_workspace`
+  / audit events make attempts visible.)
+- **Egress awareness.** Tool-executing models can make arbitrary network
+  calls. v1 documents this rather than restricting it (matching R8's "full
+  control" intent); an optional egress allowlist at the VM firewall level is
+  the recommended hardening for sensitive work.
 - Credentials: encrypted at rest (§4.3), never serialized to the client,
   scrubbed from all logs/snapshots.
 - The backend binds to `127.0.0.1` by default; a single shared bearer token
   (env-set) gates the API if bound wider. CORS locked to the frontend origin.
 - Prompt/response content is sensitive by nature → the SQLite DB and JSONL
   logs live under `data/` (gitignored); README documents backup guidance.
-- No telemetry; the only outbound traffic is to user-configured endpoints.
+- No telemetry; the only outbound app traffic is to user-configured endpoints
+  (plus whatever the models themselves do via tools, which is logged).
 
 ---
 
@@ -485,15 +635,26 @@ doesn't disturb the others.
 ### Phase 3 — Full-fidelity recording (R6, R7)
 Event Recorder (DB + JSONL), request snapshots, thinking-block capture
 (Anthropic extended thinking; OpenAI-compatible `reasoning_content`),
-tool-call/tool-result capture + manual tool-result UI, conversation history
-reconstruction + replay UI, multi-turn context assembly. **Exit criteria:**
-kill the server mid-stream → restart → transcript shows accurate partial run
-marked `interrupted`; a DuckDB query over JSONL reproduces a full conversation.
+conversation history reconstruction + replay UI, multi-turn context assembly.
+**Exit criteria:** kill the server mid-stream → restart → transcript shows
+accurate partial run marked `interrupted`; a DuckDB query over JSONL
+reproduces a full conversation.
+
+### Phase 3.5 — Tool Execution Runtime (R8)
+Standard toolset + per-provider tool-def translation, executor with streaming
+output and budgets, per-run workspaces + manifests + `tool_executions` table,
+agentic loop in the orchestrator, tool execution cards + Workspace tab in the
+UI, kill switch, serialized-bash mode, deployment/VM docs + consent flag.
+**Exit criteria:** "write and run a script that does X" broadcast to 3 models
+→ each autonomously creates and executes files in its own subdirectory, live
+terminal output streams in each panel, manifests attribute every file to the
+right model, and cancel mid-execution kills the process tree.
 
 ### Phase 4 — Judge & evaluation (R4, R5)
 Rubric model + default rubric, anonymized judge prompt + structured-output
-parsing, evaluation API + SSE, Evaluate bar, Verdict pane, RankingTable,
-DomainMatrix, `evaluation_results` persistence. **Exit criteria:** select 3
+parsing, evaluation API + SSE, judge read-only access to anonymized candidate
+workspaces, Evaluate bar, Verdict pane, RankingTable, DomainMatrix,
+`evaluation_results` persistence. **Exit criteria:** select 3
 responses → judged, ranked, domain-mapped verdict rendered and stored; judge
 run itself fully logged.
 
@@ -504,7 +665,9 @@ scroll; retry policy tuning; docs. **Exit criteria:** the analytics questions
 in §8 answerable from the UI without SQL.
 
 Rough sequencing: P0–P1 together first; P2 is the core-value milestone; P3
-before P4 (the judge depends on faithful records); P5 iterative.
+before P3.5 (recording must exist before autonomous execution — never run
+unlogged tools) and both before P4 (the judge depends on faithful records and
+artifacts); P5 iterative.
 
 ---
 
@@ -519,6 +682,11 @@ before P4 (the judge depends on faithful records); P5 iterative.
   one 429s (retry logged), cancellation mid-stream; assert DB state after each.
 - **Recorder:** crash-recovery test (kill between deltas → `interrupted`);
   golden-file test that JSONL and DB agree.
+- **Tool runtime:** executor tests — timeout kills process group, output
+  truncation, runaway-loop short-circuit, workspace manifest diff accuracy,
+  `outside_workspace` flagging, env scrubbing (spawned tool cannot see
+  provider keys), concurrent runs writing to sibling workspaces without
+  cross-talk, serialized-bash mutex ordering.
 - **Judge:** verdict-parser tests over fixture judge outputs, incl.
   schema-violating output (graceful degradation: raw text stored, structured
   fields null, UI shows raw).
@@ -536,7 +704,9 @@ before P4 (the judge depends on faithful records); P5 iterative.
 | Judge self-preference bias (judging its own family) | anonymized candidates (§5); analytics can slice results by judge model to expose bias |
 | SQLite write contention under many concurrent streams | WAL mode + single writer task consuming an asyncio queue (recorder is already a single funnel) |
 | Context window divergence in long multi-turn comparisons | per-model token accounting shown in panel footer; warn when a model's assembled history nears its limit |
-| Should tool calls ever auto-execute? | **Open** — v1: manual result entry only. A sandboxed tool runner is a v2 candidate; the event schema already supports it. |
+| Tool calls auto-execute with full VM access (R8) | **Decided.** The VM is the security boundary (dedicated/disposable VM, consent flag, scrubbed subprocess env, egress guidance — §9); per-model workspaces + manifests provide filesystem attribution (§4.4) |
+| One model damages the shared VM mid-comparison (kills the backend, fills the disk, breaks the toolchain for others) | Write-ahead recording preserves the record; per-run budgets bound the blast radius; serialized-bash mode for risky workloads; snapshot/restore is the documented recovery path |
+| A model ignores the workspace contract via bash | Not preventable with root by design — detected instead: manifest diffs set `outside_workspace`, surfaced in UI and analytics (itself a useful "instruction-following" signal per model) |
 | Multi-user later? | **Open** — schema has no user column yet; adding `owner_id` to `conversations`/`endpoints` is a small migration. Deferred deliberately. |
 | Same repo or split out? | Start in `llm-arena/` here; it shares nothing with the audio detector at runtime, so extraction later is `git filter-repo`-trivial. |
 
